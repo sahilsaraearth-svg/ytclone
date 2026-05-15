@@ -1,8 +1,31 @@
 /**
- * Google OAuth + YouTube Data API v3 routes
- * Handles token exchange and YouTube personal feed endpoints
+ * Google OAuth + YouTube feed routes (youtubei.js scraping — no API key needed)
  */
 import { Hono } from "hono";
+import { Innertube, Platform } from "youtubei.js";
+import crypto from "crypto";
+
+// Provide Node.js vm for youtubei.js
+import vm from "vm";
+(Platform as any).load({
+  runtime: "node",
+  server: true,
+  sha1Hash: async (data: string) => crypto.createHash("sha1").update(data).digest("hex"),
+  uuidv4: () => crypto.randomUUID(),
+  fetch: globalThis.fetch,
+  Headers: globalThis.Headers,
+  Request: globalThis.Request,
+  Response: globalThis.Response,
+  ReadableStream: globalThis.ReadableStream as any,
+  CustomEvent: class CustomEvent extends Event {
+    detail: any;
+    constructor(e: string, init?: any) { super(e); this.detail = init?.detail; }
+  },
+  evaluate: (code: string) => { const s = new vm.Script(code); return s.runInNewContext({}); },
+} as any);
+
+// Per-user Innertube instance cache (keyed by userId)
+const innertubeCache = new Map<string, { yt: Innertube; expiry: number }>();
 
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID ?? "";
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET ?? "";
@@ -68,13 +91,56 @@ async function getValidToken(userId: string): Promise<string | null> {
   return null;
 }
 
+// Get an authenticated Innertube instance for a user (cached 50 min)
+async function getAuthInnertube(userId: string): Promise<Innertube | null> {
+  const cached = innertubeCache.get(userId);
+  if (cached && Date.now() < cached.expiry) return cached.yt;
+
+  const entry = tokenStore.get(userId);
+  if (!entry) return null;
+
+  try {
+    const yt = await Innertube.create({ retrieve_player: false });
+    await yt.session.oauth.init({
+      access_token: entry.access_token,
+      refresh_token: entry.refresh_token ?? "",
+      expiry_date: new Date(entry.expiry).toISOString(),
+    });
+    innertubeCache.set(userId, { yt, expiry: Date.now() + 50 * 60 * 1000 });
+    return yt;
+  } catch (e) {
+    console.error("[getAuthInnertube] error:", e);
+    return null;
+  }
+}
+
+// Map a youtubei.js video item to our VideoData shape
+function mapInnertubeVideo(item: any): any {
+  try {
+    const id = item.video_id ?? item.id ?? "";
+    if (!id) return null;
+    const title = item.title?.text ?? item.title ?? "";
+    const thumb = item.thumbnails?.[0]?.url ?? item.thumbnail?.[0]?.url ?? "";
+    const channel = item.author?.name ?? item.short_byline_text?.text ?? "";
+    const channelId = item.author?.id ?? "";
+    const views = item.view_count?.text ?? item.short_view_count_text?.text ?? "";
+    const published = item.published?.text ?? item.publishedAt ?? "";
+    const duration = item.duration?.text ?? item.thumbnail_overlays?.find((o: any) => o.type === "ThumbnailOverlayTimeStatus")?.text?.text ?? "";
+    return { id, title, thumbnail: thumb, channelName: channel, channelId, viewCount: views, publishedAt: published, duration };
+  } catch { return null; }
+}
+
 async function ytFetch(endpoint: string, params: Record<string, string>, token: string) {
   const url = new URL(`${YT_API_BASE}${endpoint}`);
   Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
   const res = await fetch(url.toString(), {
     headers: { Authorization: `Bearer ${token}` },
   });
-  if (!res.ok) throw new Error(`YT API error ${res.status}`);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({})) as any;
+    const reason = body?.error?.errors?.[0]?.reason ?? body?.error?.message ?? res.status;
+    throw new Error(`YT API error ${res.status}: ${reason}`);
+  }
   return res.json() as Promise<any>;
 }
 
@@ -344,77 +410,29 @@ export const googleAuth = new Hono()
   // ── Subscription feed videos ─────────────────────────────────────────
   .get("/feed/subscriptions/videos", async (c) => {
     const userId = c.req.query("userId");
-    const token = userId ? await getValidToken(userId) : null;
+    if (!userId) return c.json({ error: "Not authenticated" }, 401);
+
+    // Ensure token is in store
+    const token = await getValidToken(userId);
     if (!token) return c.json({ error: "Not authenticated" }, 401);
 
     try {
-      // Step 1: Get user's subscriptions (up to 50)
-      const subData = await ytFetch("/subscriptions", {
-        part: "snippet",
-        mine: "true",
-        maxResults: "50",
-        order: "relevance",
-      }, token);
+      // Use youtubei.js with OAuth — scrapes YouTube directly, no API quota
+      const yt = await getAuthInnertube(userId);
+      if (!yt) return c.json({ error: "Could not init YouTube session" }, 500);
 
-      const channelIds: string[] = (subData.items ?? [])
-        .map((i: any) => i.snippet?.resourceId?.channelId)
-        .filter(Boolean);
+      const feed = await yt.getSubscriptionsFeed();
+      const items: any[] = (feed as any).videos ?? (feed as any).contents ?? [];
 
-      if (channelIds.length === 0) return c.json({ videos: [] });
+      const videos = items
+        .map(mapInnertubeVideo)
+        .filter((v: any) => v && v.id)
+        .slice(0, 60);
 
-      // Step 2: Get uploads playlist ID for each channel (batch, up to 50)
-      const channelBatch = channelIds.slice(0, 50);
-      const chanData = await ytFetch("/channels", {
-        part: "contentDetails",
-        id: channelBatch.join(","),
-        maxResults: "50",
-      }, token);
-
-      const uploadPlaylists: string[] = (chanData.items ?? [])
-        .map((i: any) => i.contentDetails?.relatedPlaylists?.uploads)
-        .filter(Boolean);
-
-      if (uploadPlaylists.length === 0) return c.json({ videos: [] });
-
-      // Step 3: Fetch latest 2 videos from each channel's uploads playlist (parallel, first 20 channels)
-      const playlistFetches = uploadPlaylists.slice(0, 20).map((plId: string) =>
-        ytFetch("/playlistItems", {
-          part: "contentDetails",
-          playlistId: plId,
-          maxResults: "3",
-        }, token).catch(() => ({ items: [] }))
-      );
-      const playlistResults = await Promise.all(playlistFetches);
-
-      // Collect unique video IDs
-      const videoIdSet = new Set<string>();
-      for (const result of playlistResults) {
-        for (const item of (result.items ?? [])) {
-          const vid = item.contentDetails?.videoId;
-          if (vid) videoIdSet.add(vid);
-        }
-      }
-
-      const videoIds = Array.from(videoIdSet).slice(0, 50);
-      if (videoIds.length === 0) return c.json({ videos: [] });
-
-      // Step 4: Batch fetch video details
-      const detailData = await ytFetch("/videos", {
-        part: "snippet,contentDetails,statistics",
-        id: videoIds.join(","),
-      }, token);
-
-      // Sort by publishedAt descending (most recent first)
-      const items = (detailData.items ?? []).sort((a: any, b: any) => {
-        const da = new Date(a.snippet?.publishedAt ?? 0).getTime();
-        const db = new Date(b.snippet?.publishedAt ?? 0).getTime();
-        return db - da;
-      });
-
-      const videos = items.map(mapYTItem).filter((v: any) => v.id);
+      console.log(`[feed/subscriptions/videos] got ${videos.length} videos for ${userId}`);
       return c.json({ videos });
     } catch (err: any) {
-      console.error("[feed/subscriptions/videos] error:", err.message);
+      console.error("[feed/subscriptions/videos] error:", err.message, err.stack?.split("\n")[1]);
       return c.json({ error: err.message }, 500);
     }
   })
