@@ -11,6 +11,22 @@ const YT_API_BASE = "https://www.googleapis.com/youtube/v3";
 // Simple in-memory token store (replace with DB in production)
 const tokenStore = new Map<string, { access_token: string; refresh_token?: string; expiry: number }>();
 
+// Session store for polling-based auth (works in Expo Go + APK + production)
+const sessionStore = new Map<string, {
+  status: "pending" | "done" | "error";
+  user?: { userId: string; name: string; email: string; avatar: string; accessToken: string };
+  error?: string;
+  createdAt: number;
+}>();
+
+// Cleanup old sessions every 10 mins
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, s] of sessionStore.entries()) {
+    if (now - s.createdAt > 10 * 60 * 1000) sessionStore.delete(id);
+  }
+}, 10 * 60 * 1000);
+
 function storeToken(userId: string, data: { access_token: string; refresh_token?: string; expires_in: number }) {
   tokenStore.set(userId, {
     access_token: data.access_token,
@@ -116,30 +132,54 @@ function mapYTItem(item: any) {
 
 export const googleAuth = new Hono()
 
+  // ── Create auth session (app calls this to start login) ─────────────
+  .post("/auth/google/session", async (c) => {
+    const sessionId = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+    sessionStore.set(sessionId, { status: "pending", createdAt: Date.now() });
+    const reqUrl = new URL(c.req.url);
+    const callbackUrl = `${reqUrl.protocol}//${reqUrl.host}/api/auth/google/callback`;
+    return c.json({ sessionId, callbackUrl });
+  })
+
+  // ── Poll session status (app polls this after opening browser) ───────
+  .get("/auth/google/session/:id", async (c) => {
+    const session = sessionStore.get(c.req.param("id"));
+    if (!session) return c.json({ status: "not_found" }, 404);
+    return c.json(session);
+  })
+
   // ── OAuth callback (browser redirects here from Google) ─────────────
   .get("/auth/google/callback", async (c) => {
     const code = c.req.query("code");
     const error = c.req.query("error");
     const stateRaw = c.req.query("state") ?? "";
 
-    // state is JSON { verifier, appReturnUrl } — fallback to plain string for legacy
+    // state is JSON { verifier, sessionId } or plain verifier string (legacy)
     let codeVerifier = stateRaw;
-    let appReturnUrl = "ytclone://auth";
+    let sessionId = "";
     try {
       const parsed = JSON.parse(decodeURIComponent(stateRaw));
       codeVerifier = parsed.verifier ?? stateRaw;
-      appReturnUrl = parsed.appReturnUrl ?? "ytclone://auth";
-    } catch { /* state was plain verifier string */ }
+      sessionId = parsed.sessionId ?? "";
+    } catch { /* plain verifier */ }
+
+    const reqUrl = new URL(c.req.url);
+    const redirectUri = `${reqUrl.protocol}//${reqUrl.host}/api/auth/google/callback`;
+
+    // HTML shown in browser after auth — tells user to go back to app
+    const successHtml = (msg: string) => c.html(`
+      <html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#0f0f0f;color:#fff">
+        <h2>${msg}</h2>
+        <p>You can close this tab and return to the app.</p>
+      </body></html>
+    `);
 
     if (error || !code) {
-      return c.redirect(`${appReturnUrl}?error=${encodeURIComponent(error ?? "no_code")}`);
+      if (sessionId) sessionStore.set(sessionId, { status: "error", error: error ?? "no_code", createdAt: Date.now() });
+      return successHtml("❌ Sign-in failed. Please try again.");
     }
 
     try {
-      // Build redirect URI dynamically from the actual request host
-      const reqUrl = new URL(c.req.url);
-      const redirectUri = `${reqUrl.protocol}//${reqUrl.host}/api/auth/google/callback`;
-
       const tokenBody: Record<string, string> = {
         grant_type: "authorization_code",
         code,
@@ -156,10 +196,10 @@ export const googleAuth = new Hono()
       });
       const data = await res.json() as any;
       if (!res.ok || !data.access_token) {
-        return c.redirect(`${appReturnUrl}?error=${encodeURIComponent(data.error_description ?? "token_failed")}`);
+        if (sessionId) sessionStore.set(sessionId, { status: "error", error: data.error_description ?? "token_failed", createdAt: Date.now() });
+        return successHtml("❌ Sign-in failed. Please try again.");
       }
 
-      // Fetch user info
       const userRes = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
         headers: { Authorization: `Bearer ${data.access_token}` },
       });
@@ -172,17 +212,23 @@ export const googleAuth = new Hono()
         expires_in: data.expires_in ?? 3600,
       });
 
-      // Redirect back to app with user data
-      const params = new URLSearchParams({
+      const userData = {
         userId,
         name: user.name ?? "",
         email: user.email ?? "",
         avatar: user.picture ?? "",
         accessToken: data.access_token,
-      });
-      return c.redirect(`${appReturnUrl}?${params.toString()}`);
+      };
+
+      // Store in session for app to poll
+      if (sessionId) {
+        sessionStore.set(sessionId, { status: "done", user: userData, createdAt: Date.now() });
+      }
+
+      return successHtml(`✅ Signed in as ${user.name}! You can close this tab and return to the app.`);
     } catch (err: any) {
-      return c.redirect(`${appReturnUrl}?error=${encodeURIComponent(err.message)}`);
+      if (sessionId) sessionStore.set(sessionId, { status: "error", error: err.message, createdAt: Date.now() });
+      return successHtml("❌ Sign-in failed. Please try again.");
     }
   })
 

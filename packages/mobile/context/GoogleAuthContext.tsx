@@ -1,10 +1,16 @@
 /**
- * GoogleAuthContext — Google Sign-In
- * Flow: app opens browser → Google consent → redirects to API /callback
- *       → API exchanges code → redirects to ytclone://auth?... deep link
- *       → openAuthSessionAsync catches it → user is signed in
+ * GoogleAuthContext — Google Sign-In (session polling flow)
  *
- * Pure JS PKCE (js-sha256) — no native modules needed
+ * Flow:
+ * 1. App calls POST /api/auth/google/session → gets sessionId + callbackUrl
+ * 2. App opens browser with Google auth URL (redirect_uri = callbackUrl)
+ * 3. User approves → Google hits our backend /callback
+ * 4. Backend exchanges code, stores user in sessionStore
+ * 5. App polls GET /api/auth/google/session/:id until status = "done"
+ * 6. App reads user data from poll response → logged in
+ *
+ * Works in Expo Go, dev build, standalone APK, and production.
+ * Pure JS PKCE (js-sha256) — no native modules.
  */
 import React, { createContext, useContext, useState, useEffect, useCallback } from "react";
 import * as WebBrowser from "expo-web-browser";
@@ -16,9 +22,6 @@ WebBrowser.maybeCompleteAuthSession();
 
 const GOOGLE_CLIENT_ID = process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID ?? "";
 const STORAGE_KEY = "zuno_google_user";
-
-// Our backend callback — Google redirects here, backend deep-links back to app
-const REDIRECT_URI = `${API_BASE}/api/auth/google/callback`;
 
 const SCOPES = [
   "openid",
@@ -82,48 +85,57 @@ export function GoogleAuthProvider({ children }: { children: React.ReactNode }) 
     try {
       setLoading(true);
 
+      // Step 1: Create session on backend
+      const sessionRes = await fetch(`${API_BASE}/api/auth/google/session`, { method: "POST" });
+      const { sessionId, callbackUrl } = await sessionRes.json() as any;
+
       const verifier = randomBase64url(64);
       const challenge = sha256Base64url(verifier);
 
       const authUrl =
         `https://accounts.google.com/o/oauth2/v2/auth` +
         `?client_id=${encodeURIComponent(GOOGLE_CLIENT_ID)}` +
-        `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` +
+        `&redirect_uri=${encodeURIComponent(callbackUrl)}` +
         `&response_type=code` +
         `&scope=${encodeURIComponent(SCOPES)}` +
         `&access_type=offline` +
         `&prompt=consent` +
         `&code_challenge=${challenge}` +
         `&code_challenge_method=S256` +
-        `&state=${encodeURIComponent(verifier)}`;
+        `&state=${encodeURIComponent(JSON.stringify({ verifier, sessionId }))}`;
 
-      // Watches for ytclone:// deep link — works in standalone/dev build, not Expo Go
-      const result = await WebBrowser.openAuthSessionAsync(authUrl, "ytclone://");
+      // Step 2: Open browser — don't wait for deep link, just open
+      WebBrowser.openBrowserAsync(authUrl);
 
-      if (result.type !== "success") {
-        console.log("[GoogleAuth] cancelled:", result.type);
-        return;
-      }
+      // Step 3: Poll backend every 2s for up to 3 minutes
+      const maxAttempts = 90;
+      let attempts = 0;
+      const poll = (): Promise<GoogleUser> => new Promise((resolve, reject) => {
+        const interval = setInterval(async () => {
+          attempts++;
+          if (attempts > maxAttempts) {
+            clearInterval(interval);
+            reject(new Error("Sign-in timed out"));
+            return;
+          }
+          try {
+            const r = await fetch(`${API_BASE}/api/auth/google/session/${sessionId}`);
+            const data = await r.json() as any;
+            if (data.status === "done" && data.user) {
+              clearInterval(interval);
+              resolve(data.user);
+            } else if (data.status === "error") {
+              clearInterval(interval);
+              reject(new Error(data.error ?? "Sign-in failed"));
+            }
+          } catch { /* network hiccup, keep polling */ }
+        }, 2000);
+      });
 
-      const urlStr = (result as any).url as string;
-      const queryStr = urlStr.includes("?") ? urlStr.split("?")[1] : urlStr.split("#")[1] ?? "";
-      const params = new URLSearchParams(queryStr);
+      const googleUser = await poll();
 
-      const error = params.get("error");
-      if (error) throw new Error(decodeURIComponent(error));
-
-      const userId = params.get("userId");
-      const accessToken = params.get("accessToken");
-      if (!userId || !accessToken) throw new Error("Missing user data in callback");
-
-      const googleUser: GoogleUser = {
-        userId,
-        name: decodeURIComponent(params.get("name") ?? ""),
-        email: decodeURIComponent(params.get("email") ?? ""),
-        avatar: decodeURIComponent(params.get("avatar") ?? ""),
-        accessToken,
-      };
-
+      // Step 4: Close browser + save user
+      WebBrowser.dismissBrowser();
       await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(googleUser));
       setUser(googleUser);
     } catch (err) {
