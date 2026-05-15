@@ -136,8 +136,11 @@ export const googleAuth = new Hono()
   .post("/auth/google/session", async (c) => {
     const sessionId = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
     sessionStore.set(sessionId, { status: "pending", createdAt: Date.now() });
+    // Use PUBLIC_API_URL env var so it always returns the correct public URL
+    const publicBase = (process.env.EXPO_PUBLIC_API_URL ?? process.env.API_BASE_URL ?? "").replace(/\/$/, "");
     const reqUrl = new URL(c.req.url);
-    const callbackUrl = `${reqUrl.protocol}//${reqUrl.host}/api/auth/google/callback`;
+    const fallback = `${reqUrl.protocol}//${reqUrl.host}`;
+    const callbackUrl = `${publicBase || fallback}/api/auth/google/callback`;
     return c.json({ sessionId, callbackUrl });
   })
 
@@ -163,8 +166,11 @@ export const googleAuth = new Hono()
       sessionId = parsed.sessionId ?? "";
     } catch { /* plain verifier */ }
 
+    const publicBase = (process.env.EXPO_PUBLIC_API_URL ?? "").replace(/\/$/, "");
     const reqUrl = new URL(c.req.url);
-    const redirectUri = `${reqUrl.protocol}//${reqUrl.host}/api/auth/google/callback`;
+    const fallback = `${reqUrl.protocol}//${reqUrl.host}`;
+    const redirectUri = `${publicBase || fallback}/api/auth/google/callback`;
+    console.log("[callback] redirectUri:", redirectUri);
 
     // HTML shown in browser after auth — tells user to go back to app
     const successHtml = (msg: string) => c.html(`
@@ -340,29 +346,73 @@ export const googleAuth = new Hono()
     if (!token) return c.json({ error: "Not authenticated" }, 401);
 
     try {
-      // Activities from subscriptions = latest videos from subscribed channels
-      const actData = await ytFetch("/activities", {
-        part: "snippet,contentDetails",
-        home: "true",
+      // Step 1: Get user's subscriptions (up to 50)
+      const subData = await ytFetch("/subscriptions", {
+        part: "snippet",
+        mine: "true",
+        maxResults: "50",
+        order: "relevance",
+      }, token);
+
+      const channelIds: string[] = (subData.items ?? [])
+        .map((i: any) => i.snippet?.resourceId?.channelId)
+        .filter(Boolean);
+
+      if (channelIds.length === 0) return c.json({ videos: [] });
+
+      // Step 2: Get uploads playlist ID for each channel (batch, up to 50)
+      const channelBatch = channelIds.slice(0, 50);
+      const chanData = await ytFetch("/channels", {
+        part: "contentDetails",
+        id: channelBatch.join(","),
         maxResults: "50",
       }, token);
 
-      const videoIds = (actData.items ?? [])
-        .filter((i: any) => i.snippet?.type === "upload")
-        .map((i: any) => i.contentDetails?.upload?.videoId)
+      const uploadPlaylists: string[] = (chanData.items ?? [])
+        .map((i: any) => i.contentDetails?.relatedPlaylists?.uploads)
         .filter(Boolean);
 
+      if (uploadPlaylists.length === 0) return c.json({ videos: [] });
+
+      // Step 3: Fetch latest 2 videos from each channel's uploads playlist (parallel, first 20 channels)
+      const playlistFetches = uploadPlaylists.slice(0, 20).map((plId: string) =>
+        ytFetch("/playlistItems", {
+          part: "contentDetails",
+          playlistId: plId,
+          maxResults: "3",
+        }, token).catch(() => ({ items: [] }))
+      );
+      const playlistResults = await Promise.all(playlistFetches);
+
+      // Collect unique video IDs
+      const videoIdSet = new Set<string>();
+      for (const result of playlistResults) {
+        for (const item of (result.items ?? [])) {
+          const vid = item.contentDetails?.videoId;
+          if (vid) videoIdSet.add(vid);
+        }
+      }
+
+      const videoIds = Array.from(videoIdSet).slice(0, 50);
       if (videoIds.length === 0) return c.json({ videos: [] });
 
-      // Fetch video details in batch
+      // Step 4: Batch fetch video details
       const detailData = await ytFetch("/videos", {
         part: "snippet,contentDetails,statistics",
-        id: videoIds.slice(0, 30).join(","),
+        id: videoIds.join(","),
       }, token);
 
-      const videos = (detailData.items ?? []).map(mapYTItem).filter((v: any) => v.id);
+      // Sort by publishedAt descending (most recent first)
+      const items = (detailData.items ?? []).sort((a: any, b: any) => {
+        const da = new Date(a.snippet?.publishedAt ?? 0).getTime();
+        const db = new Date(b.snippet?.publishedAt ?? 0).getTime();
+        return db - da;
+      });
+
+      const videos = items.map(mapYTItem).filter((v: any) => v.id);
       return c.json({ videos });
     } catch (err: any) {
+      console.error("[feed/subscriptions/videos] error:", err.message);
       return c.json({ error: err.message }, 500);
     }
   })

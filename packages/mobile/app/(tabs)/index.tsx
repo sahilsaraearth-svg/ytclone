@@ -1,4 +1,4 @@
-import React, { useCallback, useState, useRef } from "react";
+import React, { useCallback, useState, useRef, useEffect } from "react";
 import {
   View,
   Text,
@@ -36,6 +36,15 @@ export default function HomeScreen() {
   const { isDark, toggleTheme } = useTheme();
   const col = useColors();
   const { user: gUser, signIn: googleSignIn, signOut: googleSignOut, loading: gLoading } = useGoogleAuth();
+
+  // ── Auto-switch to My Feed when user logs in ──
+  const prevUser = useRef<typeof gUser>(null);
+  useEffect(() => {
+    if (gUser && !prevUser.current) {
+      setActiveChip("__my_feed__");
+    }
+    prevUser.current = gUser;
+  }, [gUser]);
 
   // ── Fetch chip categories from API ──
   const { data: catData } = useQuery({
