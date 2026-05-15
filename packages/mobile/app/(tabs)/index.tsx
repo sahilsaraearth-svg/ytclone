@@ -90,14 +90,18 @@ export default function HomeScreen() {
   const isMyFeed = activeChip === "__my_feed__";
 
   // Personal feed from Google auth
-  const { data: myFeedData, isLoading: myFeedLoading } = useQuery({
+  const { data: myFeedData, isLoading: myFeedLoading, isError: myFeedError, refetch: refetchMyFeed } = useQuery({
     queryKey: ["my-feed", gUser?.userId],
     queryFn: async () => {
       const res = await fetch(`${API_BASE}/api/feed/subscriptions/videos?userId=${gUser!.userId}`);
-      return res.json();
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      if (json.error) throw new Error(json.error);
+      return json;
     },
-    enabled: isMyFeed && !!gUser?.userId,
+    enabled: isMyFeed && !!gUser?.userId && !gLoading,
     staleTime: 5 * 60 * 1000,
+    retry: 2,
   });
 
   const videos: VideoData[] = isMyFeed
@@ -163,7 +167,24 @@ export default function HomeScreen() {
         renderItem={({ item }) => <VideoFeedCard video={item} />}
         ListHeaderComponent={ListHeader}
         ListEmptyComponent={
-          (isMyFeed ? myFeedLoading : (isLoading && !refreshing)) ? (
+          isMyFeed ? (
+            (myFeedLoading || gLoading) ? (
+              <View style={s.center}>
+                <ActivityIndicator size="large" color={C.red} />
+              </View>
+            ) : myFeedError ? (
+              <View style={s.center}>
+                <Text style={{ color: col.muted, marginBottom: 12 }}>Couldn't load feed. Tap to retry.</Text>
+                <TouchableOpacity onPress={() => refetchMyFeed()} style={{ backgroundColor: C.red, paddingHorizontal: 20, paddingVertical: 10, borderRadius: 8 }}>
+                  <Text style={{ color: "#fff", fontWeight: "600" }}>Retry</Text>
+                </TouchableOpacity>
+              </View>
+            ) : (
+              <View style={s.center}>
+                <Text style={{ color: col.muted }}>No videos found in your subscriptions.</Text>
+              </View>
+            )
+          ) : (isLoading && !refreshing) ? (
             <View style={s.center}>
               <ActivityIndicator size="large" color={C.red} />
             </View>

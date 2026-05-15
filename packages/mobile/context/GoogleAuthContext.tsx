@@ -53,6 +53,8 @@ export interface GoogleUser {
   email: string;
   avatar: string;
   accessToken: string;
+  refreshToken?: string | null;
+  expiresIn?: number;
 }
 
 interface GoogleAuthCtx {
@@ -76,7 +78,24 @@ export function GoogleAuthProvider({ children }: { children: React.ReactNode }) 
 
   useEffect(() => {
     AsyncStorage.getItem(STORAGE_KEY)
-      .then((raw) => { if (raw) setUser(JSON.parse(raw)); })
+      .then(async (raw) => {
+        if (!raw) return;
+        const saved = JSON.parse(raw) as GoogleUser;
+        // Always re-register token in backend (in-memory store resets on server restart)
+        try {
+          await fetch(`${API_BASE}/api/auth/google/store`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              userId: saved.userId,
+              accessToken: saved.accessToken,
+              refreshToken: saved.refreshToken ?? null,
+              expiresIn: saved.expiresIn ?? 3600,
+            }),
+          });
+        } catch { /* non-fatal, feed will get 401 but user is still shown as logged in */ }
+        setUser(saved);
+      })
       .catch(() => {})
       .finally(() => setLoading(false));
   }, []);

@@ -14,7 +14,7 @@ const tokenStore = new Map<string, { access_token: string; refresh_token?: strin
 // Session store for polling-based auth (works in Expo Go + APK + production)
 const sessionStore = new Map<string, {
   status: "pending" | "done" | "error";
-  user?: { userId: string; name: string; email: string; avatar: string; accessToken: string };
+  user?: { userId: string; name: string; email: string; avatar: string; accessToken: string; refreshToken?: string | null; expiresIn?: number };
   error?: string;
   createdAt: number;
 }>();
@@ -224,6 +224,8 @@ export const googleAuth = new Hono()
         email: user.email ?? "",
         avatar: user.picture ?? "",
         accessToken: data.access_token,
+        refreshToken: data.refresh_token ?? null,
+        expiresIn: data.expires_in ?? 3600,
       };
 
       // Store in session for app to poll
