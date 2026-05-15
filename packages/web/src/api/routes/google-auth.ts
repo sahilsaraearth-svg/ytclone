@@ -1,0 +1,421 @@
+/**
+ * Google OAuth + YouTube Data API v3 routes
+ * Handles token exchange and YouTube personal feed endpoints
+ */
+import { Hono } from "hono";
+
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID ?? "";
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET ?? "";
+const YT_API_BASE = "https://www.googleapis.com/youtube/v3";
+
+// Simple in-memory token store (replace with DB in production)
+const tokenStore = new Map<string, { access_token: string; refresh_token?: string; expiry: number }>();
+
+function storeToken(userId: string, data: { access_token: string; refresh_token?: string; expires_in: number }) {
+  tokenStore.set(userId, {
+    access_token: data.access_token,
+    refresh_token: data.refresh_token,
+    expiry: Date.now() + data.expires_in * 1000 - 60_000,
+  });
+}
+
+async function getValidToken(userId: string): Promise<string | null> {
+  const entry = tokenStore.get(userId);
+  if (!entry) return null;
+
+  // Still valid
+  if (Date.now() < entry.expiry) return entry.access_token;
+
+  // Try refresh
+  if (!entry.refresh_token) return null;
+  try {
+    const res = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: entry.refresh_token,
+        client_id: GOOGLE_CLIENT_ID,
+        client_secret: GOOGLE_CLIENT_SECRET,
+      }),
+    });
+    const data = await res.json() as any;
+    if (data.access_token) {
+      storeToken(userId, {
+        access_token: data.access_token,
+        refresh_token: entry.refresh_token,
+        expires_in: data.expires_in ?? 3600,
+      });
+      return data.access_token;
+    }
+  } catch { /* */ }
+  return null;
+}
+
+async function ytFetch(endpoint: string, params: Record<string, string>, token: string) {
+  const url = new URL(`${YT_API_BASE}${endpoint}`);
+  Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
+  const res = await fetch(url.toString(), {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`YT API error ${res.status}`);
+  return res.json() as Promise<any>;
+}
+
+function mapYTItem(item: any) {
+  const snippet = item.snippet ?? {};
+  const contentDetails = item.contentDetails ?? {};
+  const stats = item.statistics ?? {};
+  const vidId = item.id?.videoId ?? item.id ?? item.contentDetails?.videoId ?? "";
+  const thumbs = snippet.thumbnails ?? {};
+  const thumb = thumbs.maxres?.url ?? thumbs.high?.url ?? thumbs.medium?.url ?? thumbs.default?.url ?? "";
+
+  // Parse ISO 8601 duration
+  function parseDuration(d?: string) {
+    if (!d) return "";
+    const m = d.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+    if (!m) return "";
+    const h = parseInt(m[1] ?? "0");
+    const min = parseInt(m[2] ?? "0");
+    const sec = parseInt(m[3] ?? "0");
+    if (h > 0) return `${h}:${String(min).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+    return `${min}:${String(sec).padStart(2, "0")}`;
+  }
+
+  function formatViews(n?: string) {
+    const v = parseInt(n ?? "0");
+    if (v >= 1e9) return `${(v / 1e9).toFixed(1)}B views`;
+    if (v >= 1e6) return `${(v / 1e6).toFixed(1)}M views`;
+    if (v >= 1e3) return `${(v / 1e3).toFixed(1)}K views`;
+    return v ? `${v} views` : "";
+  }
+
+  function timeAgo(iso?: string) {
+    if (!iso) return "";
+    const diff = Date.now() - new Date(iso).getTime();
+    const days = Math.floor(diff / 86400000);
+    if (days < 1) return "Today";
+    if (days < 7) return `${days}d ago`;
+    if (days < 30) return `${Math.floor(days / 7)}w ago`;
+    if (days < 365) return `${Math.floor(days / 30)}mo ago`;
+    return `${Math.floor(days / 365)}y ago`;
+  }
+
+  return {
+    id: vidId,
+    title: snippet.title ?? "Unknown",
+    thumbnail: thumb,
+    channelName: snippet.channelTitle ?? snippet.videoOwnerChannelTitle ?? "",
+    channelId: snippet.channelId ?? snippet.videoOwnerChannelId ?? "",
+    viewCount: formatViews(stats.viewCount),
+    publishedAt: timeAgo(snippet.publishedAt),
+    duration: parseDuration(contentDetails.duration),
+    isLive: snippet.liveBroadcastContent === "live",
+  };
+}
+
+export const googleAuth = new Hono()
+
+  // ── OAuth callback (browser redirects here from Google) ─────────────
+  .get("/auth/google/callback", async (c) => {
+    const code = c.req.query("code");
+    const error = c.req.query("error");
+    const stateRaw = c.req.query("state") ?? "";
+
+    // state is JSON { verifier, appReturnUrl } — fallback to plain string for legacy
+    let codeVerifier = stateRaw;
+    let appReturnUrl = "ytclone://auth";
+    try {
+      const parsed = JSON.parse(decodeURIComponent(stateRaw));
+      codeVerifier = parsed.verifier ?? stateRaw;
+      appReturnUrl = parsed.appReturnUrl ?? "ytclone://auth";
+    } catch { /* state was plain verifier string */ }
+
+    if (error || !code) {
+      return c.redirect(`${appReturnUrl}?error=${encodeURIComponent(error ?? "no_code")}`);
+    }
+
+    try {
+      // Build redirect URI dynamically from the actual request host
+      const reqUrl = new URL(c.req.url);
+      const redirectUri = `${reqUrl.protocol}//${reqUrl.host}/api/auth/google/callback`;
+
+      const tokenBody: Record<string, string> = {
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: redirectUri,
+        client_id: GOOGLE_CLIENT_ID,
+        client_secret: GOOGLE_CLIENT_SECRET,
+      };
+      if (codeVerifier) tokenBody.code_verifier = codeVerifier;
+
+      const res = await fetch("https://oauth2.googleapis.com/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams(tokenBody),
+      });
+      const data = await res.json() as any;
+      if (!res.ok || !data.access_token) {
+        return c.redirect(`${appReturnUrl}?error=${encodeURIComponent(data.error_description ?? "token_failed")}`);
+      }
+
+      // Fetch user info
+      const userRes = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
+        headers: { Authorization: `Bearer ${data.access_token}` },
+      });
+      const user = await userRes.json() as any;
+      const userId = user.id ?? user.sub ?? "default";
+
+      storeToken(userId, {
+        access_token: data.access_token,
+        refresh_token: data.refresh_token,
+        expires_in: data.expires_in ?? 3600,
+      });
+
+      // Redirect back to app with user data
+      const params = new URLSearchParams({
+        userId,
+        name: user.name ?? "",
+        email: user.email ?? "",
+        avatar: user.picture ?? "",
+        accessToken: data.access_token,
+      });
+      return c.redirect(`${appReturnUrl}?${params.toString()}`);
+    } catch (err: any) {
+      return c.redirect(`${appReturnUrl}?error=${encodeURIComponent(err.message)}`);
+    }
+  })
+
+  // ── Exchange OAuth code for tokens (manual/direct) ──────────────────
+  .post("/auth/google/token", async (c) => {
+    try {
+      const { code, redirectUri, codeVerifier } = await c.req.json() as any;
+      if (!code || !redirectUri) return c.json({ error: "Missing code or redirectUri" }, 400);
+
+      const body: Record<string, string> = {
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: redirectUri,
+        client_id: GOOGLE_CLIENT_ID,
+        client_secret: GOOGLE_CLIENT_SECRET,
+      };
+      if (codeVerifier) body.code_verifier = codeVerifier;
+
+      const res = await fetch("https://oauth2.googleapis.com/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams(body),
+      });
+      const data = await res.json() as any;
+      if (!res.ok || !data.access_token) {
+        return c.json({ error: data.error_description ?? "Token exchange failed" }, 400);
+      }
+
+      // Fetch user info
+      const userRes = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
+        headers: { Authorization: `Bearer ${data.access_token}` },
+      });
+      const user = await userRes.json() as any;
+      const userId = user.id ?? user.sub ?? "default";
+
+      storeToken(userId, {
+        access_token: data.access_token,
+        refresh_token: data.refresh_token,
+        expires_in: data.expires_in ?? 3600,
+      });
+
+      return c.json({
+        userId,
+        name: user.name ?? "",
+        email: user.email ?? "",
+        avatar: user.picture ?? "",
+        accessToken: data.access_token,
+      });
+    } catch (err: any) {
+      return c.json({ error: err.message }, 500);
+    }
+  })
+
+  // ── Store token from client-side OAuth (expo-auth-session flow) ─────
+  .post("/auth/google/store", async (c) => {
+    try {
+      const { userId, accessToken, refreshToken, expiresIn } = await c.req.json() as any;
+      if (!userId || !accessToken) return c.json({ error: "Missing userId or accessToken" }, 400);
+      storeToken(userId, {
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        expires_in: expiresIn ?? 3600,
+      });
+      return c.json({ ok: true });
+    } catch (err: any) {
+      return c.json({ error: err.message }, 500);
+    }
+  })
+
+  // ── Revoke / logout ─────────────────────────────────────────────────
+  .post("/auth/google/revoke", async (c) => {
+    const { userId } = await c.req.json() as any;
+    if (userId) tokenStore.delete(userId);
+    return c.json({ ok: true });
+  })
+
+  // ── Subscription feed ───────────────────────────────────────────────
+  .get("/feed/subscriptions", async (c) => {
+    const userId = c.req.query("userId");
+    const token = userId ? await getValidToken(userId) : null;
+    if (!token) return c.json({ error: "Not authenticated" }, 401);
+
+    try {
+      // Get subscriptions list
+      const subData = await ytFetch("/subscriptions", {
+        part: "snippet",
+        mine: "true",
+        maxResults: "50",
+        order: "alphabetical",
+      }, token);
+
+      const channels = (subData.items ?? []).map((item: any) => ({
+        id: item.snippet?.resourceId?.channelId ?? "",
+        name: item.snippet?.title ?? "",
+        avatar: item.snippet?.thumbnails?.default?.url ?? "",
+        description: item.snippet?.description ?? "",
+      })).filter((c: any) => c.id);
+
+      return c.json({ channels });
+    } catch (err: any) {
+      return c.json({ error: err.message }, 500);
+    }
+  })
+
+  // ── Subscription feed videos ─────────────────────────────────────────
+  .get("/feed/subscriptions/videos", async (c) => {
+    const userId = c.req.query("userId");
+    const token = userId ? await getValidToken(userId) : null;
+    if (!token) return c.json({ error: "Not authenticated" }, 401);
+
+    try {
+      // Activities from subscriptions = latest videos from subscribed channels
+      const actData = await ytFetch("/activities", {
+        part: "snippet,contentDetails",
+        home: "true",
+        maxResults: "50",
+      }, token);
+
+      const videoIds = (actData.items ?? [])
+        .filter((i: any) => i.snippet?.type === "upload")
+        .map((i: any) => i.contentDetails?.upload?.videoId)
+        .filter(Boolean);
+
+      if (videoIds.length === 0) return c.json({ videos: [] });
+
+      // Fetch video details in batch
+      const detailData = await ytFetch("/videos", {
+        part: "snippet,contentDetails,statistics",
+        id: videoIds.slice(0, 30).join(","),
+      }, token);
+
+      const videos = (detailData.items ?? []).map(mapYTItem).filter((v: any) => v.id);
+      return c.json({ videos });
+    } catch (err: any) {
+      return c.json({ error: err.message }, 500);
+    }
+  })
+
+  // ── Home / Recommended feed ─────────────────────────────────────────
+  .get("/feed/home", async (c) => {
+    const userId = c.req.query("userId");
+    const token = userId ? await getValidToken(userId) : null;
+    if (!token) return c.json({ error: "Not authenticated" }, 401);
+
+    try {
+      // YouTube Data API doesn't expose personalized home feed directly.
+      // Best proxy: mix of subscriptions activities + trending
+      const actData = await ytFetch("/activities", {
+        part: "snippet,contentDetails",
+        home: "true",
+        maxResults: "50",
+      }, token);
+
+      const videoIds = (actData.items ?? [])
+        .filter((i: any) => i.snippet?.type === "upload")
+        .map((i: any) => i.contentDetails?.upload?.videoId)
+        .filter(Boolean)
+        .slice(0, 30);
+
+      if (videoIds.length === 0) return c.json({ videos: [], source: "empty" });
+
+      const detailData = await ytFetch("/videos", {
+        part: "snippet,contentDetails,statistics",
+        id: videoIds.join(","),
+      }, token);
+
+      const videos = (detailData.items ?? []).map(mapYTItem).filter((v: any) => v.id);
+      return c.json({ videos, source: "subscriptions" });
+    } catch (err: any) {
+      return c.json({ error: err.message }, 500);
+    }
+  })
+
+  // ── Liked videos ─────────────────────────────────────────────────────
+  .get("/feed/liked", async (c) => {
+    const userId = c.req.query("userId");
+    const token = userId ? await getValidToken(userId) : null;
+    if (!token) return c.json({ error: "Not authenticated" }, 401);
+
+    try {
+      // "LL" is the liked videos playlist ID
+      const data = await ytFetch("/playlistItems", {
+        part: "snippet,contentDetails",
+        playlistId: "LL",
+        maxResults: "50",
+      }, token);
+
+      const videoIds = (data.items ?? [])
+        .map((i: any) => i.contentDetails?.videoId)
+        .filter(Boolean);
+
+      if (videoIds.length === 0) return c.json({ videos: [] });
+
+      const detailData = await ytFetch("/videos", {
+        part: "snippet,contentDetails,statistics",
+        id: videoIds.join(","),
+      }, token);
+
+      const videos = (detailData.items ?? []).map(mapYTItem).filter((v: any) => v.id);
+      return c.json({ videos, total: data.pageInfo?.totalResults ?? videos.length });
+    } catch (err: any) {
+      return c.json({ error: err.message }, 500);
+    }
+  })
+
+  // ── Watch Later ──────────────────────────────────────────────────────
+  .get("/feed/watch-later", async (c) => {
+    const userId = c.req.query("userId");
+    const token = userId ? await getValidToken(userId) : null;
+    if (!token) return c.json({ error: "Not authenticated" }, 401);
+
+    try {
+      // "WL" is the Watch Later playlist ID
+      const data = await ytFetch("/playlistItems", {
+        part: "snippet,contentDetails",
+        playlistId: "WL",
+        maxResults: "50",
+      }, token);
+
+      const videoIds = (data.items ?? [])
+        .map((i: any) => i.contentDetails?.videoId)
+        .filter(Boolean);
+
+      if (videoIds.length === 0) return c.json({ videos: [] });
+
+      const detailData = await ytFetch("/videos", {
+        part: "snippet,contentDetails,statistics",
+        id: videoIds.join(","),
+      }, token);
+
+      const videos = (detailData.items ?? []).map(mapYTItem).filter((v: any) => v.id);
+      return c.json({ videos, total: data.pageInfo?.totalResults ?? videos.length });
+    } catch (err: any) {
+      return c.json({ error: err.message }, 500);
+    }
+  });

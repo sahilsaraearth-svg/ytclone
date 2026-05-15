@@ -1,0 +1,52 @@
+{
+  "expo": {
+    "icon": "./assets/icon.png",
+    "android": {
+      "package": "com.ytclone_k9x2.runable",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/icon.png",
+        "backgroundColor": "#0F0F0F"
+      },
+      "edgeToEdgeEnabled": true,
+      "permissions": []
+    },
+    "extra": {
+      "apiUrl": "https://2tdfvywpn3k00ply1gky9-preview-4200.runable.site/",
+      "router": {},
+      "eas": {
+        "projectId": "636424b1-ad13-400f-9d14-a599d72dfe44"
+      }
+    },
+    "ios": {
+      "bundleIdentifier": "com.ytclone_k9x2.runable",
+      "supportsTablet": true
+    },
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0B0B0B"
+    },
+    "name": "Zuno",
+    "slug": "ytclone",
+    "owner": "sahil207003",
+    "version": "1.0.0",
+    "scheme": "ytclone",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "web": {
+      "favicon": "./assets/favicon.png",
+      "bundler": "metro"
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "react-native-video",
+        {
+          "enableNotificationControls": false
+        }
+      ],
+      "expo-web-browser"
+    ]
+  }
+}
