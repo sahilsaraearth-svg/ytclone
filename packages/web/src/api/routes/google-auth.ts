@@ -412,27 +412,85 @@ export const googleAuth = new Hono()
     const userId = c.req.query("userId");
     if (!userId) return c.json({ error: "Not authenticated" }, 401);
 
-    // Ensure token is in store
     const token = await getValidToken(userId);
     if (!token) return c.json({ error: "Not authenticated" }, 401);
 
     try {
-      // Use youtubei.js with OAuth — scrapes YouTube directly, no API quota
-      const yt = await getAuthInnertube(userId);
-      if (!yt) return c.json({ error: "Could not init YouTube session" }, 500);
+      // Step 1: get subscribed channel IDs
+      const subRes = await fetch(
+        "https://www.googleapis.com/youtube/v3/subscriptions?part=snippet&mine=true&maxResults=50&order=relevance",
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      const subJson = await subRes.json() as any;
+      if (!subRes.ok) {
+        console.error("[feed] subscriptions error:", JSON.stringify(subJson?.error));
+        return c.json({ error: subJson?.error?.message ?? "subscriptions failed" }, 500);
+      }
 
-      const feed = await yt.getSubscriptionsFeed();
-      const items: any[] = (feed as any).videos ?? (feed as any).contents ?? [];
+      const channelIds: string[] = (subJson.items ?? [])
+        .map((i: any) => i.snippet?.resourceId?.channelId)
+        .filter(Boolean);
 
-      const videos = items
-        .map(mapInnertubeVideo)
-        .filter((v: any) => v && v.id)
-        .slice(0, 60);
+      if (channelIds.length === 0) return c.json({ videos: [] });
 
-      console.log(`[feed/subscriptions/videos] got ${videos.length} videos for ${userId}`);
+      // Step 2: get uploads playlist IDs for those channels
+      const chanRes = await fetch(
+        `https://www.googleapis.com/youtube/v3/channels?part=contentDetails&id=${channelIds.slice(0, 50).join(",")}&maxResults=50`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      const chanJson = await chanRes.json() as any;
+      if (!chanRes.ok) {
+        console.error("[feed] channels error:", JSON.stringify(chanJson?.error));
+        return c.json({ error: chanJson?.error?.message ?? "channels failed" }, 500);
+      }
+
+      const playlists: string[] = (chanJson.items ?? [])
+        .map((i: any) => i.contentDetails?.relatedPlaylists?.uploads)
+        .filter(Boolean);
+
+      if (playlists.length === 0) return c.json({ videos: [] });
+
+      // Step 3: fetch latest 2 videos from first 15 channels in parallel
+      const videoIdSet = new Set<string>();
+      await Promise.all(
+        playlists.slice(0, 15).map(async (plId: string) => {
+          try {
+            const r = await fetch(
+              `https://www.googleapis.com/youtube/v3/playlistItems?part=contentDetails&playlistId=${plId}&maxResults=3`,
+              { headers: { Authorization: `Bearer ${token}` } }
+            );
+            const j = await r.json() as any;
+            for (const item of (j.items ?? [])) {
+              const vid = item.contentDetails?.videoId;
+              if (vid) videoIdSet.add(vid);
+            }
+          } catch { /* skip failed playlist */ }
+        })
+      );
+
+      const videoIds = Array.from(videoIdSet).slice(0, 40);
+      if (videoIds.length === 0) return c.json({ videos: [] });
+
+      // Step 4: batch fetch video details
+      const vidRes = await fetch(
+        `https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails,statistics&id=${videoIds.join(",")}`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      const vidJson = await vidRes.json() as any;
+      if (!vidRes.ok) {
+        console.error("[feed] videos error:", JSON.stringify(vidJson?.error));
+        return c.json({ error: vidJson?.error?.message ?? "videos fetch failed" }, 500);
+      }
+
+      const sorted = (vidJson.items ?? []).sort((a: any, b: any) =>
+        new Date(b.snippet?.publishedAt ?? 0).getTime() - new Date(a.snippet?.publishedAt ?? 0).getTime()
+      );
+
+      const videos = sorted.map(mapYTItem).filter((v: any) => v.id);
+      console.log(`[feed] returning ${videos.length} videos for ${userId}`);
       return c.json({ videos });
     } catch (err: any) {
-      console.error("[feed/subscriptions/videos] error:", err.message, err.stack?.split("\n")[1]);
+      console.error("[feed/subscriptions/videos] error:", err.message);
       return c.json({ error: err.message }, 500);
     }
   })
