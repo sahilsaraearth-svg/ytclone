@@ -16,11 +16,15 @@ import React, { createContext, useContext, useState, useEffect, useCallback } fr
 import * as WebBrowser from "expo-web-browser";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { sha256 } from "js-sha256";
+import Constants from "expo-constants";
 import { API_BASE } from "../lib/config";
 
 WebBrowser.maybeCompleteAuthSession();
 
-const GOOGLE_CLIENT_ID = process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID ?? "";
+const GOOGLE_CLIENT_ID =
+  Constants.expoConfig?.extra?.googleClientId ??
+  process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID ??
+  "";
 const STORAGE_KEY = "zuno_google_user";
 
 const SCOPES = [
@@ -78,22 +82,9 @@ export function GoogleAuthProvider({ children }: { children: React.ReactNode }) 
 
   useEffect(() => {
     AsyncStorage.getItem(STORAGE_KEY)
-      .then(async (raw) => {
+      .then((raw) => {
         if (!raw) return;
         const saved = JSON.parse(raw) as GoogleUser;
-        // Always re-register token in backend (in-memory store resets on server restart)
-        try {
-          await fetch(`${API_BASE}/api/auth/google/store`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              userId: saved.userId,
-              accessToken: saved.accessToken,
-              refreshToken: saved.refreshToken ?? null,
-              expiresIn: saved.expiresIn ?? 3600,
-            }),
-          });
-        } catch { /* non-fatal, feed will get 401 but user is still shown as logged in */ }
         setUser(saved);
       })
       .catch(() => {})

@@ -12,6 +12,7 @@
     },
     "extra": {
       "apiUrl": "https://2tdfvywpn3k00ply1gky9-preview-4200.runable.site/",
+      "googleClientId": "865212305827-fd4ae1j7q6m2mguc5gr55ihbbv3i8gkq.apps.googleusercontent.com",
       "router": {},
       "eas": {
         "projectId": "636424b1-ad13-400f-9d14-a599d72dfe44"
