@@ -1,38 +1,14 @@
 /**
- * Google OAuth + YouTube feed routes (youtubei.js scraping — no API key needed)
+ * Google OAuth + YouTube feed routes
  */
 import { Hono } from "hono";
-import { Innertube, Platform } from "youtubei.js";
-import crypto from "crypto";
-
-// Provide Node.js vm for youtubei.js
-import vm from "vm";
-(Platform as any).load({
-  runtime: "node",
-  server: true,
-  sha1Hash: async (data: string) => crypto.createHash("sha1").update(data).digest("hex"),
-  uuidv4: () => crypto.randomUUID(),
-  fetch: globalThis.fetch,
-  Headers: globalThis.Headers,
-  Request: globalThis.Request,
-  Response: globalThis.Response,
-  ReadableStream: globalThis.ReadableStream as any,
-  CustomEvent: class CustomEvent extends Event {
-    detail: any;
-    constructor(e: string, init?: any) { super(e); this.detail = init?.detail; }
-  },
-  evaluate: (code: string) => { const s = new vm.Script(code); return s.runInNewContext({}); },
-} as any);
-
-// Per-user Innertube instance cache (keyed by userId)
-const innertubeCache = new Map<string, { yt: Innertube; expiry: number }>();
+import { db } from "../database";
+import { googleTokens } from "../database/schema";
+import { eq } from "drizzle-orm";
 
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID ?? "";
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET ?? "";
 const YT_API_BASE = "https://www.googleapis.com/youtube/v3";
-
-// Simple in-memory token store (replace with DB in production)
-const tokenStore = new Map<string, { access_token: string; refresh_token?: string; expiry: number }>();
 
 // Session store for polling-based auth (works in Expo Go + APK + production)
 const sessionStore = new Map<string, {
@@ -50,84 +26,54 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000);
 
-function storeToken(userId: string, data: { access_token: string; refresh_token?: string; expires_in: number }) {
-  tokenStore.set(userId, {
-    access_token: data.access_token,
-    refresh_token: data.refresh_token,
-    expiry: Date.now() + data.expires_in * 1000 - 60_000,
+async function storeToken(userId: string, data: { access_token: string; refresh_token?: string; expires_in: number }) {
+  const expiry = Date.now() + data.expires_in * 1000 - 60_000;
+  await db.insert(googleTokens).values({
+    userId,
+    accessToken: data.access_token,
+    refreshToken: data.refresh_token ?? null,
+    expiry,
+  }).onConflictDoUpdate({
+    target: googleTokens.userId,
+    set: {
+      accessToken: data.access_token,
+      refreshToken: data.refresh_token ?? null,
+      expiry,
+    },
   });
 }
 
 async function getValidToken(userId: string): Promise<string | null> {
-  const entry = tokenStore.get(userId);
+  const [entry] = await db.select().from(googleTokens).where(eq(googleTokens.userId, userId)).limit(1);
   if (!entry) return null;
 
   // Still valid
-  if (Date.now() < entry.expiry) return entry.access_token;
+  if (Date.now() < entry.expiry) return entry.accessToken;
 
   // Try refresh
-  if (!entry.refresh_token) return null;
+  if (!entry.refreshToken) return null;
   try {
     const res = await fetch("https://oauth2.googleapis.com/token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
         grant_type: "refresh_token",
-        refresh_token: entry.refresh_token,
+        refresh_token: entry.refreshToken,
         client_id: GOOGLE_CLIENT_ID,
         client_secret: GOOGLE_CLIENT_SECRET,
       }),
     });
     const data = await res.json() as any;
     if (data.access_token) {
-      storeToken(userId, {
+      await storeToken(userId, {
         access_token: data.access_token,
-        refresh_token: entry.refresh_token,
+        refresh_token: entry.refreshToken,
         expires_in: data.expires_in ?? 3600,
       });
       return data.access_token;
     }
   } catch { /* */ }
   return null;
-}
-
-// Get an authenticated Innertube instance for a user (cached 50 min)
-async function getAuthInnertube(userId: string): Promise<Innertube | null> {
-  const cached = innertubeCache.get(userId);
-  if (cached && Date.now() < cached.expiry) return cached.yt;
-
-  const entry = tokenStore.get(userId);
-  if (!entry) return null;
-
-  try {
-    const yt = await Innertube.create({ retrieve_player: false });
-    await yt.session.oauth.init({
-      access_token: entry.access_token,
-      refresh_token: entry.refresh_token ?? "",
-      expiry_date: new Date(entry.expiry).toISOString(),
-    });
-    innertubeCache.set(userId, { yt, expiry: Date.now() + 50 * 60 * 1000 });
-    return yt;
-  } catch (e) {
-    console.error("[getAuthInnertube] error:", e);
-    return null;
-  }
-}
-
-// Map a youtubei.js video item to our VideoData shape
-function mapInnertubeVideo(item: any): any {
-  try {
-    const id = item.video_id ?? item.id ?? "";
-    if (!id) return null;
-    const title = item.title?.text ?? item.title ?? "";
-    const thumb = item.thumbnails?.[0]?.url ?? item.thumbnail?.[0]?.url ?? "";
-    const channel = item.author?.name ?? item.short_byline_text?.text ?? "";
-    const channelId = item.author?.id ?? "";
-    const views = item.view_count?.text ?? item.short_view_count_text?.text ?? "";
-    const published = item.published?.text ?? item.publishedAt ?? "";
-    const duration = item.duration?.text ?? item.thumbnail_overlays?.find((o: any) => o.type === "ThumbnailOverlayTimeStatus")?.text?.text ?? "";
-    return { id, title, thumbnail: thumb, channelName: channel, channelId, viewCount: views, publishedAt: published, duration };
-  } catch { return null; }
 }
 
 async function ytFetch(endpoint: string, params: Record<string, string>, token: string) {
@@ -375,7 +321,7 @@ export const googleAuth = new Hono()
   // ── Revoke / logout ─────────────────────────────────────────────────
   .post("/auth/google/revoke", async (c) => {
     const { userId } = await c.req.json() as any;
-    if (userId) tokenStore.delete(userId);
+    if (userId) await db.delete(googleTokens).where(eq(googleTokens.userId, userId));
     return c.json({ ok: true });
   })
 
